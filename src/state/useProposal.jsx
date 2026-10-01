@@ -1,12 +1,17 @@
-import { createContext, useContext, useState } from "react";
+import { createContext, useCallback, useContext, useRef, useState } from "react";
 import { SERVICE_TEMPLATES } from "../constants/serviceTemplates";
 import { PAYMENT_TERMS_OPTIONS, DEFAULT_NOTES } from "../constants/proposalDefaults";
+import { requestProposalId } from "../share/proposalId";
 
 // ============================================================
 // PROPOSAL STATE
-//
+//*test ignore*
 // Single source of state for the whole app. Every step component
 // reads what it needs via useProposal() — no prop drilling.
+//
+// The proposal number is deliberately NOT part of proposalData:
+// it is allocated by the server, must never change, and must
+// never be reachable by updateField.
 // ============================================================
 const ProposalContext = createContext(null);
 
@@ -32,6 +37,50 @@ export function ProposalProvider({ children }) {
   const [selectedServiceTypes, setSelectedServiceTypes] = useState([]);
   const [serviceConfigs, setServiceConfigs] = useState({});
   const [previewMode, setPreviewMode] = useState(false);
+
+  // ── The proposal number ──
+  const [proposalId, setProposalId] = useState(null);
+  const [proposalIdBusy, setProposalIdBusy] = useState(false);
+  const [proposalIdError, setProposalIdError] = useState(null);
+
+  // Refs, not state, because both guards have to hold within a single render
+  // pass. Without them React would allocate twice — StrictMode runs effects
+  // twice in development, and each call spends a number for good.
+  const proposalIdRef = useRef(null);
+  const inFlight = useRef(null);
+
+  /**
+   * Allocate this proposal's number, once. Idempotent by design: after the
+   * first success every later call resolves to the same number, which is what
+   * makes it unchangeable for the life of the wizard.
+   *
+   * @returns {Promise<number|null>} null when allocation failed — the reason
+   *   is in proposalIdError and the call can be retried.
+   */
+  const ensureProposalId = useCallback(async (accessCode) => {
+    if (proposalIdRef.current) return proposalIdRef.current;
+    if (inFlight.current) return inFlight.current;
+
+    setProposalIdError(null);
+    setProposalIdBusy(true);
+
+    inFlight.current = requestProposalId(accessCode)
+      .then((id) => {
+        proposalIdRef.current = id;
+        setProposalId(id);
+        return id;
+      })
+      .catch((err) => {
+        setProposalIdError(err.message || "הקצאת מספר ההצעה נכשלה");
+        // Clear only on failure, so a retry is possible while a success stays
+        // pinned to the one number this proposal will ever have.
+        inFlight.current = null;
+        return null;
+      })
+      .finally(() => setProposalIdBusy(false));
+
+    return inFlight.current;
+  }, []);
 
   const updateField = (field, value) => {
     setProposalData((prev) => ({ ...prev, [field]: value }));
@@ -156,7 +205,7 @@ export function ProposalProvider({ children }) {
             }),
           });
         }
-      } else if (key === "campaigns_meta" || key === "campaigns_google" || key === "campaigns_tiktok") {
+      } else if (key === "campaigns_meta" || key === "campaigns_google" || key === "campaigns_tiktok" || key === "campaigns_chatgpt") {
         sections.push({
           type: "campaigns",
           title:
@@ -164,7 +213,9 @@ export function ProposalProvider({ children }) {
               ? "קמפיינים ממומנים במטא (פייסבוק ואינסטגרם)"
               : key === "campaigns_google"
                 ? "קמפיינים ממומנים בגוגל"
-                : "קמפיינים ממומנים בטיקטוק",
+                : key === "campaigns_tiktok"
+                  ? "קמפיינים ממומנים בטיקטוק"
+                  : "קמפיינים ממומנים ב-ChatGPT",
           setupTitle:
             key === "campaigns_meta"
               ? "הקמת הקמפיינים כוללת:"
@@ -194,6 +245,18 @@ export function ProposalProvider({ children }) {
           description: config.customDescription || "",
           items: (config.customItems || "").split("\n").filter(Boolean),
         });
+      } else if (key === "newsletter") {
+        sections.push({
+          type: "newsletter",
+          title: "ניוזלטר",
+          setupTitle: "הקמה והיערכות ראשונית כוללות:",
+          setupItems: template.setupItems.filter(
+            (_, i) => !isItemExcluded(key, "setup", i)
+          ),
+          managementItems: template.managementItems.filter(
+            (_, i) => !isItemExcluded(key, "management", i)
+          ),
+        });
       } else {
         sections.push({
           type: "generic",
@@ -219,6 +282,7 @@ export function ProposalProvider({ children }) {
       value={{
         step, setStep,
         proposalData, setProposalData,
+        proposalId, proposalIdBusy, proposalIdError, ensureProposalId,
         selectedServiceTypes,
         serviceConfigs,
         previewMode, setPreviewMode,

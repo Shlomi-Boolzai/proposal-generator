@@ -11,9 +11,10 @@ import { randomBytes } from "node:crypto";
 //
 // There is no database. One folder per proposal:
 //
-//   proposals/<token>/meta.json     the record
-//   proposals/<token>/original.pdf  what the client is asked to sign
-//   proposals/<token>/signed.pdf    written once, at signing time
+//   proposals/<token>/meta.json      the record
+//   proposals/<token>/original.pdf   what the client is asked to sign
+//   proposals/<token>/signed.pdf     written once, at signing time
+//   proposals/<token>/proposal.docx  the editable Word original
 //
 // Every blob is private; the token is both the key and the
 // secret, so nothing here may ever build a pathname out of an
@@ -28,6 +29,23 @@ import { randomBytes } from "node:crypto";
 // ============================================================
 
 const PREFIX = "proposals";
+
+/** Everything this system stores about proposals lives under here. */
+export const PROPOSALS_PREFIX = `${PREFIX}/`;
+
+/**
+ * The running proposal number lives in its own blob, outside the proposals
+ * prefix so that listing proposals can never trip over it.
+ *
+ * NEVER DELETE THIS BLOB. There is no way to rebuild it from the store
+ * without reading every meta.json, so losing it restarts numbering at
+ * FIRST_PROPOSAL_ID and hands out numbers that are already on documents
+ * sitting with clients.
+ */
+export const COUNTER_PATH = "counters/proposal-id.json";
+
+/** The number the first proposal gets. Everything after is +1. */
+export const FIRST_PROPOSAL_ID = 50001;
 
 /** 24 random bytes, base64url-encoded — always exactly 32 characters. */
 const TOKEN_BYTES = 24;
@@ -45,12 +63,17 @@ export const STATUS = {
   PENDING: "pending", // record created, PDF not uploaded yet
   SENT: "sent", // PDF in place, link is live
   SIGNED: "signed", // terminal
+  // Replaced by a later send of the same proposal number. Terminal, and its
+  // link is dead: supersede() also pulls expiresAt back to the moment of
+  // replacement, so the signing app refuses it without knowing this status.
+  SUPERSEDED: "superseded",
 };
 
 const NEXT_STATUS = {
-  [STATUS.PENDING]: [STATUS.SENT],
-  [STATUS.SENT]: [STATUS.SIGNED],
+  [STATUS.PENDING]: [STATUS.SENT, STATUS.SUPERSEDED],
+  [STATUS.SENT]: [STATUS.SIGNED, STATUS.SUPERSEDED],
   [STATUS.SIGNED]: [],
+  [STATUS.SUPERSEDED]: [],
 };
 
 // ---------- tokens and paths ----------
@@ -64,9 +87,9 @@ export function isValidToken(token) {
 }
 
 /**
- * The three keys belonging to one proposal. Throws on a token that could
- * escape the prefix — every Blob call in both projects goes through here,
- * so this is the one place a traversal attempt has to be stopped.
+ * The keys belonging to one proposal. Throws on a token that could escape the
+ * prefix — every Blob call in both projects goes through here, so this is the
+ * one place a traversal attempt has to be stopped.
  */
 export function paths(token) {
   if (!isValidToken(token)) {
@@ -78,17 +101,96 @@ export function paths(token) {
     meta: `${base}/meta.json`,
     original: `${base}/original.pdf`,
     signed: `${base}/signed.pdf`,
+    docx: `${base}/proposal.docx`,
   };
+}
+
+/**
+ * The token a `proposals/<token>/…` pathname belongs to, or null when the
+ * pathname is not one of ours. Used to walk a listing back to its records.
+ */
+export function tokenFromPath(pathname) {
+  if (typeof pathname !== "string") return null;
+  const [prefix, token, ...rest] = pathname.split("/");
+  if (prefix !== PREFIX || rest.length !== 1 || !isValidToken(token)) return null;
+  return token;
+}
+
+/** What the Word copy is called wherever it is handed to a person. */
+export function docxFileName(fileName) {
+  const base = fileName || "proposal.pdf";
+  return `${base.replace(/\.pdf$/i, "")}.docx`;
+}
+
+// ---------- the proposal number ----------
+
+/**
+ * The number a person quotes on the phone. Unlike the token it is not a
+ * secret and carries no entropy — it only has to be unique and stable, so
+ * anything that is not a whole number at or above the first id is refused
+ * rather than coerced.
+ */
+export function isValidProposalId(value) {
+  return Number.isInteger(value) && value >= FIRST_PROPOSAL_ID;
+}
+
+/**
+ * Pure half of allocation: given the stored counter, the number to hand out
+ * and the counter to store back. Absent counter means this is the first
+ * proposal ever.
+ *
+ * A corrupt counter throws instead of falling back to FIRST_PROPOSAL_ID.
+ * Blocking new proposals is recoverable; re-issuing a number that is already
+ * printed on a signed document is not.
+ */
+export function takeProposalId(counter) {
+  if (counter === null || counter === undefined) {
+    return {
+      proposalId: FIRST_PROPOSAL_ID,
+      counter: { next: FIRST_PROPOSAL_ID + 1 },
+    };
+  }
+
+  const next = counter?.next;
+  if (!isValidProposalId(next)) {
+    throw new Error(
+      `The proposal id counter at ${COUNTER_PATH} is unreadable — refusing to allocate a number that may already be in use`,
+    );
+  }
+
+  return { proposalId: next, counter: { next: next + 1 } };
+}
+
+/** How the number is worded wherever it is shown to a person. */
+export function proposalRef(proposalId) {
+  if (!isValidProposalId(proposalId)) {
+    throw new Error("Invalid proposal id");
+  }
+  return `הצעה מס' ${proposalId}`;
 }
 
 // ---------- the record ----------
 
 export function newMeta(
-  { token, clientName, companyName, subject, clientEmail, fileName, expiresInDays },
+  {
+    token,
+    proposalId,
+    clientName,
+    companyName,
+    subject,
+    clientEmail,
+    fileName,
+    expiresInDays,
+  },
   now = new Date(),
 ) {
   if (!isValidToken(token)) {
     throw new Error("Invalid proposal token");
+  }
+  // The browser echoes back the number the server allocated it, so this is
+  // both a typo guard and the reason no record can exist without a number.
+  if (!isValidProposalId(proposalId)) {
+    throw new Error("A valid proposal id is required");
   }
   if (typeof clientEmail !== "string" || !EMAIL_PATTERN.test(clientEmail)) {
     throw new Error("A valid client email is required");
@@ -103,6 +205,9 @@ export function newMeta(
 
   return {
     token,
+    // Written once here and never touched again — nothing in either project
+    // rewrites it, which is what makes the number on the PDF trustworthy.
+    proposalId,
     createdAt: now.toISOString(),
     expiresAt: new Date(now.getTime() + days * DAY_MS).toISOString(),
     status: STATUS.PENDING,
@@ -133,6 +238,42 @@ export function isExpired(meta, now = new Date()) {
 export function signedFileName(fileName) {
   const base = fileName || "proposal.pdf";
   return `${base.replace(/\.pdf$/i, "")}_חתום.pdf`;
+}
+
+/**
+ * The record of an earlier send, retired because `byToken` now carries the
+ * same proposal number to the client.
+ *
+ * Expiry is what actually kills the link: both the signing page and the
+ * signing route already refuse an expired record, so an old link stops
+ * working even on a signing app deployed before this status existed.
+ *
+ * A signed record cannot be superseded — assertTransition throws — because
+ * the signature is on that document, not on its replacement.
+ */
+export function supersede(meta, byToken, now = new Date()) {
+  assertTransition(meta.status, STATUS.SUPERSEDED);
+  const at = now.toISOString();
+  return {
+    ...meta,
+    status: STATUS.SUPERSEDED,
+    supersededAt: at,
+    supersededBy: byToken,
+    // Never extend: an already-expired link stays expired from its own date.
+    expiresAt: isExpired(meta, now) ? meta.expiresAt : at,
+  };
+}
+
+/**
+ * Whether `meta` is an earlier record of `proposalId` that a new send under
+ * token `byToken` should retire.
+ */
+export function isSupersededBy(meta, proposalId, byToken) {
+  return (
+    meta?.proposalId === proposalId &&
+    meta.token !== byToken &&
+    canTransition(meta.status, STATUS.SUPERSEDED)
+  );
 }
 
 export function canTransition(from, to) {
@@ -169,4 +310,27 @@ export const PDF_PUT_OPTIONS = {
   addRandomSuffix: false,
   allowOverwrite: true,
   contentType: "application/pdf",
+};
+
+/**
+ * The Word original is uploaded alongside the PDF, so that the archive can
+ * hand back an editable document and not only a raster.
+ */
+export const DOCX_CONTENT_TYPE =
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+
+export const DOCX_PUT_OPTIONS = {
+  ...PRIVATE,
+  addRandomSuffix: false,
+  allowOverwrite: true,
+  contentType: DOCX_CONTENT_TYPE,
+};
+
+export const COUNTER_PUT_OPTIONS = {
+  ...PRIVATE,
+  addRandomSuffix: false,
+  allowOverwrite: true,
+  contentType: "application/json",
+  // A cached counter would hand the same number to the next proposal.
+  cacheControlMaxAge: 0,
 };

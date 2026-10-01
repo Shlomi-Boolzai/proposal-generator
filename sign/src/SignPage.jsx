@@ -159,6 +159,19 @@ export default function SignPage({ token }) {
               <div style={styles.cardTitle}>
                 {proposal.subject || "הצעת מחיר"}
               </div>
+              {/* Older proposals predate numbering and simply have none. */}
+              {proposal.proposalId && (
+                <div
+                  style={{
+                    marginBottom: "10px",
+                    fontSize: "13px",
+                    fontWeight: 700,
+                    color: BRAND.purpleSoft,
+                  }}
+                >
+                  הצעה מס' {proposal.proposalId}
+                </div>
+              )}
               <p style={styles.note}>
                 {proposal.clientName ? `שלום ${proposal.clientName}, ` : ""}
                 לפניכם הצעת המחיר{proposal.companyName ? ` עבור ${proposal.companyName}` : ""}.
@@ -228,9 +241,6 @@ export default function SignPage({ token }) {
                 {phase === "submitting" ? "⏳ שולח…" : "אישור וחתימה"}
               </button>
 
-              <p style={{ ...styles.note, fontSize: "12px", marginTop: "12px", textAlign: "center" }}>
-                לאחר החתימה יישלח אליכם עותק חתום במייל.
-              </p>
             </div>
           </>
         )}

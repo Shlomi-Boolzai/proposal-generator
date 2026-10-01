@@ -4,10 +4,14 @@ import {
   newToken,
   isValidToken,
   paths,
+  tokenFromPath,
+  docxFileName,
   newMeta,
   isExpired,
   canTransition,
   assertTransition,
+  supersede,
+  isSupersededBy,
 } from "./proposal.js";
 
 describe("newToken", () => {
@@ -58,6 +62,7 @@ describe("paths", () => {
       meta: `proposals/${token}/meta.json`,
       original: `proposals/${token}/original.pdf`,
       signed: `proposals/${token}/signed.pdf`,
+      docx: `proposals/${token}/proposal.docx`,
     });
   });
 
@@ -68,9 +73,40 @@ describe("paths", () => {
   });
 });
 
+describe("tokenFromPath", () => {
+  const token = "a".repeat(32);
+
+  it("reads the token back out of any of a proposal's keys", () => {
+    for (const key of ["meta.json", "original.pdf", "signed.pdf", "proposal.docx"]) {
+      expect(tokenFromPath(`proposals/${token}/${key}`)).toBe(token);
+    }
+  });
+
+  it("returns null for anything that is not one proposal's file", () => {
+    // The listing is untrusted input in the same way a token is: it decides
+    // which pathnames get turned back into Blob reads.
+    expect(tokenFromPath("counters/proposal-id.json")).toBeNull();
+    expect(tokenFromPath(`proposals/${token}`)).toBeNull();
+    expect(tokenFromPath(`proposals/${token}/nested/file.pdf`)).toBeNull();
+    expect(tokenFromPath("proposals/../secret/meta.json")).toBeNull();
+    expect(tokenFromPath(undefined)).toBeNull();
+  });
+});
+
+describe("docxFileName", () => {
+  it("swaps the pdf extension for docx", () => {
+    expect(docxFileName("הצעת_מחיר_50001_חברה.pdf")).toBe("הצעת_מחיר_50001_חברה.docx");
+  });
+
+  it("falls back when the record carries no file name", () => {
+    expect(docxFileName("")).toBe("proposal.docx");
+  });
+});
+
 describe("newMeta", () => {
   const now = new Date("2026-01-01T10:00:00.000Z");
   const input = {
+    proposalId: 50001,
     clientName: "דנה כהן",
     companyName: "אקמה בע\"מ",
     subject: "ניהול סושיאל",
@@ -178,5 +214,49 @@ describe("status transitions", () => {
     expect(() => assertTransition(STATUS.SIGNED, STATUS.SENT)).toThrow(
       /signed.*sent/i,
     );
+  });
+});
+
+describe("superseding a re-sent proposal", () => {
+  const now = new Date("2026-03-01T12:00:00.000Z");
+  const oldToken = "a".repeat(32);
+  const newToken_ = "b".repeat(32);
+  const sent = {
+    token: oldToken,
+    proposalId: 50010,
+    status: STATUS.SENT,
+    expiresAt: "2026-03-20T12:00:00.000Z",
+  };
+
+  it("expires the old link at the moment of replacement", () => {
+    const retired = supersede(sent, newToken_, now);
+    expect(retired.status).toBe(STATUS.SUPERSEDED);
+    expect(retired.supersededBy).toBe(newToken_);
+    expect(retired.supersededAt).toBe(now.toISOString());
+    expect(isExpired(retired, now)).toBe(true);
+  });
+
+  it("never pushes an already-past expiry forward", () => {
+    const stale = { ...sent, expiresAt: "2026-02-01T00:00:00.000Z" };
+    expect(supersede(stale, newToken_, now).expiresAt).toBe(stale.expiresAt);
+  });
+
+  it("leaves the original record untouched", () => {
+    supersede(sent, newToken_, now);
+    expect(sent.status).toBe(STATUS.SENT);
+  });
+
+  it("refuses to supersede a signed proposal", () => {
+    expect(() => supersede({ ...sent, status: STATUS.SIGNED }, newToken_, now)).toThrow();
+  });
+
+  it("picks only earlier, replaceable records of the same number", () => {
+    expect(isSupersededBy(sent, 50010, newToken_)).toBe(true);
+    expect(isSupersededBy({ ...sent, status: STATUS.PENDING }, 50010, newToken_)).toBe(true);
+    expect(isSupersededBy(sent, 50011, newToken_)).toBe(false);
+    expect(isSupersededBy(sent, 50010, oldToken)).toBe(false);
+    expect(isSupersededBy({ ...sent, status: STATUS.SIGNED }, 50010, newToken_)).toBe(false);
+    expect(isSupersededBy({ ...sent, status: STATUS.SUPERSEDED }, 50010, newToken_)).toBe(false);
+    expect(isSupersededBy(null, 50010, newToken_)).toBe(false);
   });
 });

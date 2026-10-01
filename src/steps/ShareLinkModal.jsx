@@ -19,7 +19,13 @@ import { getAccessCode, setAccessCode } from "../share/api";
 
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
-export default function ShareLinkModal({ proposalData, onClose }) {
+export default function ShareLinkModal({
+  proposalData,
+  proposalId,
+  sections,
+  notes,
+  onClose,
+}) {
   const [clientEmail, setClientEmail] = useState("");
   const [expiresInDays, setExpiresInDays] = useState(DEFAULT_EXPIRY_DAYS);
   const [accessCode, setCode] = useState(getAccessCode);
@@ -29,7 +35,11 @@ export default function ShareLinkModal({ proposalData, onClose }) {
   const [result, setResult] = useState(null);
   const [resend, setResend] = useState({ busy: false, note: null });
   const [copied, setCopied] = useState(false);
+  // Off by default: the generated PDF is the norm, a supplied one the exception.
+  const [manualPdf, setManualPdf] = useState(false);
+  const [pdfFile, setPdfFile] = useState(null);
   const emailRef = useRef(null);
+  const fileRef = useRef(null);
 
   useEffect(() => {
     emailRef.current?.focus();
@@ -44,6 +54,46 @@ export default function ShareLinkModal({ proposalData, onClose }) {
   }, [busy, onClose]);
 
   const emailValid = EMAIL_PATTERN.test(clientEmail.trim());
+  // Ticking the box without choosing a file would silently send the generated
+  // PDF — the opposite of what was asked for — so it blocks sending instead.
+  const pdfReady = !manualPdf || !!pdfFile;
+
+  const toggleManualPdf = () => {
+    if (busy) return;
+    setManualPdf((on) => {
+      // Dropping the file on the way out means un-ticking always returns to the
+      // generated PDF, with no stale selection lingering behind the checkbox.
+      if (on) {
+        setPdfFile(null);
+        if (fileRef.current) fileRef.current.value = "";
+      }
+      return !on;
+    });
+    setError(null);
+  };
+
+  const handleFileChange = (e) => {
+    const file = e.target.files?.[0] ?? null;
+    setError(null);
+
+    if (!file) {
+      setPdfFile(null);
+      return;
+    }
+
+    // Browsers do not always set type from the extension, so accept either.
+    const isPdf =
+      file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf");
+
+    if (!isPdf || file.size === 0) {
+      setError(isPdf ? "הקובץ ריק." : "יש לבחור קובץ PDF בלבד.");
+      setPdfFile(null);
+      e.target.value = "";
+      return;
+    }
+
+    setPdfFile(file);
+  };
 
   const handleCreate = async () => {
     setError(null);
@@ -51,9 +101,15 @@ export default function ShareLinkModal({ proposalData, onClose }) {
     try {
       const created = await createSignLink({
         proposalData,
+        proposalId,
         clientEmail: clientEmail.trim(),
         expiresInDays,
         accessCode: accessCode.trim(),
+        pdfFile: manualPdf ? pdfFile : null,
+        // Archived whichever way the PDF was produced: a manually uploaded
+        // file still gets the generated Word copy filed beside it.
+        sections,
+        notes,
         onProgress: setStage,
       });
       setAccessCode(accessCode.trim());
@@ -119,7 +175,8 @@ export default function ShareLinkModal({ proposalData, onClose }) {
         {!result ? (
           <>
             <p style={hint}>
-              נייצר קובץ PDF של ההצעה, ניצור קישור אישי ונשלח אותו במייל ללקוח.
+              נייצר קובץ PDF של <strong style={{ color: "#c7d2fe" }}>הצעה מס' {proposalId}</strong>,
+              ניצור קישור אישי ונשלח אותו במייל ללקוח.
               הלקוח יוכל לקרוא ולחתום ישירות מהטלפון.
             </p>
 
@@ -148,6 +205,40 @@ export default function ShareLinkModal({ proposalData, onClose }) {
                 placeholder="client@company.co.il"
                 disabled={busy}
               />
+            </div>
+
+            <div style={{ marginBottom: "16px" }}>
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: "10px",
+                  cursor: busy ? "default" : "pointer",
+                  fontSize: "13px",
+                }}
+                onClick={toggleManualPdf}
+              >
+                <span style={styles.checkbox(manualPdf)}>{manualPdf ? "✓" : ""}</span>
+                <span>העלאת PDF ידנית במקום הקובץ שנוצר</span>
+              </div>
+
+              {manualPdf && (
+                <div style={{ marginTop: "10px" }}>
+                  <input
+                    ref={fileRef}
+                    style={{ ...styles.input, padding: "8px 12px" }}
+                    type="file"
+                    accept="application/pdf,.pdf"
+                    onChange={handleFileChange}
+                    disabled={busy}
+                  />
+                  <div style={{ ...hint, margin: "8px 0 0", color: "red", fontSize: "20px",fontWeight: "bold" }}>
+                    {pdfFile
+                      ? `נבחר: ${pdfFile.name} — הקובץ הזה יישלח ללקוח במקום ההצעה שנוצרה.`
+                      : `*יש לוודא שמספר ההצעה (${proposalId}) מופיעה בקובץ.`}
+                  </div>
+                </div>
+              )}
             </div>
 
             <div style={{ marginBottom: "20px" }}>

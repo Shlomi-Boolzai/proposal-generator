@@ -15,6 +15,7 @@ import {
   ImageRun,
 } from "docx";
 import { saveAs } from "file-saver";
+import { buildFileName } from "./exportPdf";
 
 let _coverImageBuffer = null;
 async function getCoverImage() {
@@ -27,11 +28,14 @@ async function getCoverImage() {
 
 const FONT = "Jura";           // Latin/English font
 const FONT_CS = "Fb Gandalf";  // Hebrew (Complex Script) font
-const COLOR_PRIMARY = "4338CA";
-const COLOR_HEADER_BG = "EEF2FF";
-const COLOR_BORDER = "C7D2FE";
-const COLOR_LIGHT_BORDER = "E2E8F0";
-const COLOR_NOTES_BG = "F8FAFC";
+// The document is monochrome; only the cover image on page 1 carries brand
+// colour. Mirrors DOC in styles/appStyles.js, which does the same job for the
+// on-screen preview and therefore for the PDF — keep the two in step.
+const COLOR_PRIMARY = "000000";
+const COLOR_BORDER = "000000";
+const COLOR_LIGHT_BORDER = "000000";
+// Fills stay light so the text on them survives; black would swallow it.
+const COLOR_HEADER_BG = "F5F5F5";
 
 const border = (color = COLOR_LIGHT_BORDER) => ({
   style: BorderStyle.SINGLE,
@@ -90,23 +94,54 @@ function bulletItem(text, ref = "bullets") {
     bidirectional: true,
     alignment: AlignmentType.RIGHT,
     numbering: { reference: ref, level: 0 },
-    spacing: { after: 60 },
+    // Twips — 120 = 6pt, matching BulletList's 8px itemGap in Preview.jsx.
+    spacing: { after: 120 },
     children: [rtlRun(text, { size: 22 })],
   });
 }
 
-export async function generateDocx(proposalData, sections, activeNotes) {
+/**
+ * @param {object} [options]
+ * @param {boolean} [options.returnBlob]  hand back `{ blob, fileName }` instead
+ *        of saving to disk — that is how the send flow gets a copy to archive.
+ *        Mirrors generatePdf, so both documents are produced the same way.
+ */
+export async function generateDocx(
+  proposalData,
+  sections,
+  activeNotes,
+  proposalId,
+  { returnBlob = false } = {},
+) {
+  if (!Number.isInteger(proposalId)) {
+    throw new Error("לא הוקצה מספר להצעה — יש לרענן את מסך התצוגה המקדימה.");
+  }
+
   const coverImageData = await getCoverImage();
   const docChildren = [];
 
   // ── Header ──
+  // Same line, and same position, as the on-screen preview and the PDF.
+  docChildren.push(
+    rtlParagraph(
+      [
+        rtlRun(`הצעת מחיר מס' ${proposalId}`, {
+          size: 24,
+          bold: true,
+          color: COLOR_PRIMARY,
+        }),
+      ],
+      { spacing: { after: 80 } }
+    )
+  );
+
   docChildren.push(
     rtlParagraph(
       [
         rtlRun(`תאריך: ${proposalData.date}`, {
           size: 22,
           color: COLOR_PRIMARY,
-          
+
         }),
       ],
       { spacing: { after: 80 } }
@@ -151,7 +186,7 @@ export async function generateDocx(proposalData, sections, activeNotes) {
           rtlRun(`הנידון: ${proposalData.subject}`, {
             size: 32,
             
-            color: "312E81",
+            color: COLOR_PRIMARY,
           }),
         ],
         { spacing: { after: 300 } }
@@ -165,7 +200,7 @@ export async function generateDocx(proposalData, sections, activeNotes) {
 
     if (section.description) {
       docChildren.push(
-        rtlParagraph([rtlRun(section.description, { size: 22, color: "475569" })], {
+        rtlParagraph([rtlRun(section.description, { size: 22, color: COLOR_PRIMARY })], {
           spacing: { after: 200 },
         })
       );
@@ -181,20 +216,32 @@ export async function generateDocx(proposalData, sections, activeNotes) {
       section.setupItems.forEach((item) => docChildren.push(bulletItem(item)));
       docChildren.push(rtlParagraph([], { spacing: { after: 100 } }));
 
-      section.managementSections.forEach((ms) => {
+      // Grouped exactly as SocialSection does it in Preview.jsx — Facebook,
+      // Instagram and LinkedIn describe the same work and collapse into one
+      // block, TikTok keeps its own. Keep the two in step.
+      const platforms = section.managementSections || [];
+      const general = [
+        ...new Set(
+          platforms
+            .filter((ms) => ms.platform !== "TikTok")
+            .flatMap((ms) => ms.items)
+        ),
+      ];
+      const tiktok = platforms.find((ms) => ms.platform === "TikTok");
+
+      const managementBlock = (title, items) => {
         docChildren.push(
-          rtlParagraph(
-            [
-              rtlRun(`ניהול עמוד ${ms.platform} עסקי:`, {
-                size: 22,
-                bold: true,
-              }),
-            ],
-            { spacing: { before: 160, after: 100 } }
-          )
+          rtlParagraph([rtlRun(title, { size: 22, bold: true })], {
+            spacing: { before: 160, after: 100 },
+          })
         );
-        ms.items.forEach((item) => docChildren.push(bulletItem(item)));
-      });
+        items.forEach((item) => docChildren.push(bulletItem(item)));
+      };
+
+      if (general.length > 0) managementBlock("ניהול עמוד עסקי כולל:", general);
+      if (tiktok?.items?.length > 0) {
+        managementBlock("ניהול עמוד TikTok עסקי:", tiktok.items);
+      }
     }
 
     if (section.type === "campaigns") {
@@ -210,6 +257,27 @@ export async function generateDocx(proposalData, sections, activeNotes) {
       docChildren.push(
         rtlParagraph(
           [rtlRun("ניהול הקמפיינים כולל:", { size: 22, bold: true })],
+          { spacing: { before: 160, after: 100 } }
+        )
+      );
+      section.managementItems.forEach((item) =>
+        docChildren.push(bulletItem(item))
+      );
+    }
+
+    if (section.type === "newsletter") {
+      docChildren.push(
+        rtlParagraph(
+          [rtlRun(section.setupTitle, { size: 22, bold: true })],
+          { spacing: { after: 100 } }
+        )
+      );
+      section.setupItems.forEach((item) => docChildren.push(bulletItem(item)));
+      docChildren.push(rtlParagraph([], { spacing: { after: 100 } }));
+
+      docChildren.push(
+        rtlParagraph(
+          [rtlRun("השירות החודשי כולל:", { size: 22, bold: true })],
           { spacing: { before: 160, after: 100 } }
         )
       );
@@ -333,7 +401,7 @@ export async function generateDocx(proposalData, sections, activeNotes) {
             rtlRun(`סה"כ: ${proposalData.totalAmount}`, {
               size: 26,
               bold: true,
-              color: "312E81",
+              color: COLOR_PRIMARY,
             }),
           ],
           { spacing: { before: 120, after: 300 } }
@@ -343,7 +411,10 @@ export async function generateDocx(proposalData, sections, activeNotes) {
   }
 
   // ── Notes ──
+  // Same rule as the PDF: the notes open a page of their own, so the pricing
+  // table and its total stay together on the page above.
   if (activeNotes.length > 0) {
+    docChildren.push(new Paragraph({ children: [new PageBreak()] }));
     docChildren.push(heading("הערות", 2));
     activeNotes.forEach((note) => docChildren.push(bulletItem(note, "noteBullets")));
     docChildren.push(rtlParagraph([], { spacing: { after: 200 } }));
@@ -499,7 +570,7 @@ export async function generateDocx(proposalData, sections, activeNotes) {
                       bidirectional: true,
                       alignment: AlignmentType.CENTER,
                       children: [
-                        rtlRun("חתימה וחותמת", { size: 20, color: "64748B" }),
+                        rtlRun("חתימה וחותמת", { size: 20, color: COLOR_PRIMARY }),
                       ],
                     }),
                   ],
@@ -518,7 +589,7 @@ export async function generateDocx(proposalData, sections, activeNotes) {
                       bidirectional: true,
                       alignment: AlignmentType.CENTER,
                       children: [
-                        rtlRun("תאריך", { size: 20, color: "64748B" }),
+                        rtlRun("תאריך", { size: 20, color: COLOR_PRIMARY }),
                       ],
                     }),
                   ],
@@ -603,9 +674,11 @@ export async function generateDocx(proposalData, sections, activeNotes) {
     ],
   });
 
-  const buffer = await Packer.toBlob(doc);
-  const fileName = proposalData.companyName
-    ? `הצעת_מחיר_${proposalData.companyName.replace(/\s+/g, "_")}.docx`
-    : `הצעת_מחיר_${proposalData.date.replace(/\//g, "-")}.docx`;
-  saveAs(buffer, fileName);
+  const blob = await Packer.toBlob(doc);
+  // Same stem as the PDF, so the two halves of one proposal sit together in a
+  // folder — and so docxFileName() on the server can derive one from the other.
+  const fileName = buildFileName(proposalData, proposalId).replace(/\.pdf$/i, ".docx");
+
+  if (returnBlob) return { blob, fileName };
+  saveAs(blob, fileName);
 }
